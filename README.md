@@ -38,9 +38,7 @@ cpanm POE::Component::Server::JSONUnix
 # PROTOCOL
 
 The framing is newline-delimited JSON: each message is a single JSON
-object on its own line, terminated by "\n". (Pretty-printed, multi-line
-JSON is not supported by the default filter; see "Changing the
-framing".)
+object on its own line, terminated by "\n".
 
 A request looks like:
 
