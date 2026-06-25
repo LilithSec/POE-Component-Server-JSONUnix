@@ -6,6 +6,8 @@ use v5.10;
 use mro;
 
 use Carp             qw(carp croak);
+use File::Basename   ();
+use File::Spec       ();
 use Socket           qw(PF_UNIX SOCK_STREAM);
 use IO::Socket::UNIX ();
 use JSON::MaybeXS    ();
@@ -17,7 +19,7 @@ use POE qw(
 	Driver::SysRW
 );
 
-our $VERSION = '0.0.1';
+our $VERSION = '0.1.0';
 
 =head1 NAME
 
@@ -148,6 +150,17 @@ C<on_error> -- code reference called as
 C<< $cb->($operation, $errnum, $errstr [, $wheel_id]) >> on listen and
 connection I/O errors. Normal client disconnects are not reported.
 
+=item *
+
+C<auth_temp_dir> -- directory used for the cookie-file ownership challenge.
+Defaults to C<File::Spec-E<gt>tmpdir> (usually C</tmp>).
+
+=item *
+
+C<auth_required> -- if set to a true value, all commands except C<auth_start>
+and C<auth_verify> return an error until the client has successfully completed
+the ownership challenge. Defaults to false.
+
 =back
 
 =cut
@@ -164,6 +177,8 @@ sub spawn {
 		socket_mode     => delete $args{socket_mode},                       # e.g. 0600
 		unlink_existing => ( delete $args{unlink_existing} ) // 1,
 		on_error        => delete $args{on_error},                          # coderef (optional)
+		auth_temp_dir   => ( delete $args{auth_temp_dir} ) // File::Spec->tmpdir,
+		auth_required   => ( delete $args{auth_required} ) // 0,
 		commands        => {},
 		clients         => {},
 		json            => JSON::MaybeXS->new(
@@ -254,6 +269,7 @@ sub _register_builtins {
 			return { commands => $server->command_names };
 		},
 	);
+	$self->_register_auth_builtins;
 	return;
 } ## end sub _register_builtins
 
@@ -278,6 +294,111 @@ sub _register_cmd_methods {
 	}
 	return;
 } ## end sub _register_cmd_methods
+
+sub _register_auth_builtins {
+	my ($self) = @_;
+
+	$self->register(
+		auth_start => sub {
+			my ( $server, $req, $ctx ) = @_;
+			my $id     = $ctx->{wheel_id};
+			my $client = $server->{clients}{$id};
+			my $cookie = _random_cookie();
+			$client->{auth_cookie} = $cookie;
+			$client->{auth_time}   = time();
+			return {
+				cookie   => $cookie,
+				temp_dir => $server->{auth_temp_dir},
+			};
+		},
+
+		auth_verify => sub {
+			my ( $server, $req, $ctx ) = @_;
+			my $id     = $ctx->{wheel_id};
+			my $client = $server->{clients}{$id};
+
+			unless ( defined $client->{auth_cookie} ) {
+				$ctx->error('no pending auth challenge: call auth_start first');
+				return;
+			}
+
+			my $path = $req->{args}{path} // '';
+			unless ( $path && File::Spec->file_name_is_absolute($path) ) {
+				$ctx->error('args.path must be an absolute file path');
+				return;
+			}
+
+			# Must be directly inside auth_temp_dir — no subdirectories.
+			my $temp_dir = $server->{auth_temp_dir};
+			my $dirname  = File::Basename::dirname($path);
+			unless ( $dirname eq $temp_dir ) {
+				$ctx->error("path must be a file directly inside $temp_dir");
+				return;
+			}
+
+			# lstat so we never follow symlinks.
+			my @st = lstat($path);
+			unless (@st) {
+				delete $client->{auth_cookie};
+				$ctx->error('verification file not found');
+				return;
+			}
+
+			if ( -l _ ) {
+				unlink $path;
+				delete $client->{auth_cookie};
+				$ctx->error('verification file must not be a symbolic link');
+				return;
+			}
+
+			unless ( -f _ ) {
+				delete $client->{auth_cookie};
+				$ctx->error('verification file must be a regular file');
+				return;
+			}
+
+			# Read the file contents (limit to avoid reading huge files).
+			my $content = '';
+			if ( open( my $fh, '<:raw', $path ) ) {
+				read( $fh, $content, 256 );
+				close($fh);
+			}
+			unlink($path);    # clean up regardless of outcome
+			$content =~ s/\s+\z//;    # strip trailing whitespace the client may have added
+
+			my $expected = $client->{auth_cookie};
+			delete $client->{auth_cookie};
+			delete $client->{auth_time};
+
+			unless ( $content eq $expected ) {
+				$ctx->error('cookie mismatch: verification failed');
+				return;
+			}
+
+			my $uid      = $st[4];
+			my $username = ( getpwuid($uid) )[0] // '';
+
+			$client->{auth_uid}      = $uid;
+			$client->{auth_username} = $username;
+
+			return { uid => $uid + 0, username => $username };
+		},
+	);
+	return;
+} ## end sub _register_auth_builtins
+
+sub _random_cookie {
+	my $bytes = '';
+	if ( open( my $fh, '<:raw', '/dev/urandom' ) ) {
+		read( $fh, $bytes, 16 );
+		close($fh);
+	}
+	# Fallback: should never happen on a Unix system.
+	unless ( length($bytes) == 16 ) {
+		$bytes = pack( 'N4', map { int( rand(2**32) ) } 1 .. 4 );
+	}
+	return unpack( 'H*', $bytes );    # 32 lowercase hex chars
+}
 
 =head2 shutdown
 
@@ -396,6 +517,9 @@ sub _poe_got_connection {
 	$self->{clients}{ $wheel->ID } = {
 		wheel             => $wheel,
 		close_after_flush => 0,
+		auth_cookie       => undef,
+		auth_uid          => undef,
+		auth_username     => undef,
 	};
 	return;
 } ## end sub _poe_got_connection
@@ -445,6 +569,14 @@ sub _poe_client_input {
 	unless ( defined $cmd_name ) {
 		$ctx->error("missing 'command' field");
 		return;
+	}
+
+	# Enforce auth_required: only auth_start and auth_verify bypass the gate.
+	if ( $self->{auth_required} && !defined( $self->{clients}{$id}{auth_uid} ) ) {
+		unless ( $cmd_name eq 'auth_start' || $cmd_name eq 'auth_verify' ) {
+			$ctx->error('authentication required: call auth_start then auth_verify first');
+			return;
+		}
 	}
 
 	my $handler = $self->{commands}{$cmd_name};
@@ -560,6 +692,22 @@ sub request   { $_[0]{request} }
 sub command   { $_[0]{command} }
 sub id        { $_[0]{req_id} }
 sub responded { $_[0]{responded} }
+
+# Auth accessors — defined after a successful auth_verify.
+sub authenticated {
+	my ($self) = @_;
+	return defined $self->{server}{clients}{ $self->{wheel_id} }{auth_uid};
+}
+
+sub uid {
+	my ($self) = @_;
+	return $self->{server}{clients}{ $self->{wheel_id} }{auth_uid};
+}
+
+sub username {
+	my ($self) = @_;
+	return $self->{server}{clients}{ $self->{wheel_id} }{auth_username};
+}
 
 # Send a full response envelope. status defaults to 'ok'; the request id, if
 # present, is echoed back automatically. Only the first call has any effect.
@@ -698,6 +846,19 @@ Accessors for the decoded request, its C<id>, and the command name.
 
 Close this client's connection once any queued output has been flushed.
 
+=item C<< $ctx->authenticated >>
+
+True if this client has completed a successful C<auth_verify> exchange.
+
+=item C<< $ctx->uid >>
+
+The numeric UID of the authenticated user, or C<undef> if not yet verified.
+
+=item C<< $ctx->username >>
+
+The username corresponding to C<< $ctx->uid >>, or C<undef> if not yet
+verified.
+
 =back
 
 =head1 BUILT-IN COMMANDS
@@ -712,7 +873,70 @@ Returns C<< {pong => 1, time => <epoch>} >>.
 
 Returns C<< {commands => [ ...names... ]} >> -- handy for discovery.
 
+=item C<auth_start>
+
+Begins the Unix-ownership challenge. Returns
+C<< {cookie => "<hex>", temp_dir => "<dir>"} >>. The client must write the
+cookie string to a new regular file inside C<temp_dir> and then call
+C<auth_verify>.
+
+=item C<auth_verify>
+
+Completes the challenge. C<args> must contain C<path>: the absolute path of the
+file the client wrote in C<temp_dir>. The server:
+
+=over 4
+
+=item 1. Confirms the path is a regular (non-symlink) file directly inside C<auth_temp_dir>.
+
+=item 2. Reads the file and checks it contains the cookie from C<auth_start>.
+
+=item 3. C<stat>s the file to obtain the owning UID.
+
+=item 4. Deletes the temp file.
+
 =back
+
+On success returns C<< {uid => <uid>, username => "<name>"} >>. The connection
+is now considered authenticated; subsequent handlers can inspect
+C<< $ctx->uid >> and C<< $ctx->username >>.
+
+=back
+
+=head1 USER VERIFICATION
+
+The ownership challenge lets the server verify which Unix user is on the other
+end of a connection without any password or token. Because the OS assigns file
+ownership based on the creating process's effective UID, a client that can write
+a correctly-named cookie file owned by UID I<N> must be running as UID I<N>.
+
+    # Server side
+    my $server = POE::Component::Server::JSONUnix->spawn(
+        socket_path   => '/tmp/app.sock',
+        auth_required => 1,           # reject other commands until authed
+    );
+
+    $server->register(
+        whoami => sub {
+            my ($server, $req, $ctx) = @_;
+            return { uid => $ctx->uid, username => $ctx->username };
+        },
+    );
+
+    # Client side (pseudo-code)
+    send({ command => 'auth_start' });
+    my $res = recv();                  # {cookie => "...", temp_dir => "/tmp"}
+
+    my $path = "$res->{temp_dir}/verify_$$";
+    open(my $fh, '>', $path) or die $!;
+    print $fh $res->{cookie};
+    close $fh;
+
+    send({ command => 'auth_verify', args => { path => $path } });
+    my $auth = recv();                 # {uid => 1000, username => "alice"}
+
+    send({ command => 'whoami' });
+    my $me = recv();                   # {uid => 1000, username => "alice"}
 
 =head1 Changing the framing
 
