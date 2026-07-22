@@ -17,3 +17,11 @@ t/08-permissions.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t
+examples/auth_client.pl
+examples/auth_server.pl
+examples/blocking_client.pl
+examples/client.pl
+examples/permissions_client.pl
+examples/permissions_server.pl
+examples/poe_auth_client.pl
+examples/server.pl
