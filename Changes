@@ -1,6 +1,6 @@
 Revision history for POE-Component-Server-JSONUnix
 
-0.1.0   2026-07-21
+0.1.0   2026-07-21/20:30
         - Add Unix-ownership authentication: auth_start/auth_verify built-in
           commands, the auth_required and auth_temp_dir spawn arguments, and
           the authenticated/uid/username context accessors.
